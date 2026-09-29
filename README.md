@@ -135,6 +135,24 @@ Implementations of domain contracts (HTTP/DB/FS/etc.) + service implementations.
   /presentation
 ```
 
+## Debug diagnostics
+
+`UseRepoMixin` and the built-in `RoutingKitRoutingService` expose immutable,
+metadata-only snapshots for Inspector integrations. They are created only while
+assertions are enabled and return `null` in release/profile execution.
+
+`UseRepoDebugSnapshot` describes current dependency kinds and types, state,
+pending repository types, subscription counts, rebuild generations, and latest
+trigger metadata. `RoutingDebugSnapshot` describes the matched declared route
+pattern, full route/module/middleware lineage, navigation phase, timing, and
+coalesced callers. Neither model contains dependency keys, payloads, parameter
+values, errors, messages, URLs, or stack traces.
+
+Custom routing implementations can opt in by implementing
+`RoutingDebugInfoProvider`; the base `RoutingService` contract is unchanged.
+These APIs are intended only for diagnostics and must never control application
+behavior.
+
 ## Cross‑Module Usage Rules
 
 * Import **domain** (contracts/models) across modules.
