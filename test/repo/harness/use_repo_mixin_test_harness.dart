@@ -34,6 +34,9 @@ class UseRepoConsumer
   int errorCalls = 0;
   Object? lastError;
 
+  /// Exposes the metadata-only dependency snapshot for diagnostics tests.
+  UseRepoDebugSnapshot? get debugSnapshot => useRepoDebugSnapshot;
+
   /// Forces the consumer to recompute its derived dependency state.
   Future<void> refresh() => refreshDependencies();
 
@@ -77,6 +80,9 @@ class SlowSnapshotUseRepoConsumer
   String? lastSnapshot;
   final Completer<void> firstSnapshotCaptured = Completer<void>();
 
+  /// Exposes the metadata-only dependency snapshot for diagnostics tests.
+  UseRepoDebugSnapshot? get debugSnapshot => useRepoDebugSnapshot;
+
   @override
   FutureOr<String> onDependenciesReady(UseHooks use) async {
     readyCalls++;
@@ -117,6 +123,9 @@ class ControlledInitialBuildConsumer
   final firstSnapshotCaptured = Completer<void>();
   final releaseFirstBuild = Completer<void>();
   int readyCalls = 0;
+
+  /// Exposes the metadata-only dependency snapshot for diagnostics tests.
+  UseRepoDebugSnapshot? get debugSnapshot => useRepoDebugSnapshot;
 
   @override
   Future<int> onDependenciesReady(UseHooks use) async {
@@ -164,6 +173,9 @@ class ExternalSignalConsumer
   int readyCalls = 0;
   int errorCalls = 0;
   Object? lastError;
+
+  /// Exposes the metadata-only dependency snapshot for diagnostics tests.
+  UseRepoDebugSnapshot? get debugSnapshot => useRepoDebugSnapshot;
 
   @override
   FutureOr<String> onDependenciesReady(UseHooks use) {
@@ -215,6 +227,9 @@ class PayloadStreamConsumer
   int readyCalls = 0;
   int errorCalls = 0;
   Object? lastError;
+
+  /// Exposes the metadata-only dependency snapshot for diagnostics tests.
+  UseRepoDebugSnapshot? get debugSnapshot => useRepoDebugSnapshot;
 
   @override
   FutureOr<String> onDependenciesReady(UseHooks use) {

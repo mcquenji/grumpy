@@ -116,10 +116,12 @@ final class _WatchedExternalDependency {
   _WatchedExternalDependency({
     required this.changeSignal,
     required this.subscription,
+    required this.valueType,
   });
 
   Stream changeSignal;
   StreamSubscription subscription;
+  final Type valueType;
   Object? lastError;
   StackTrace? lastStackTrace;
 
@@ -142,10 +144,24 @@ final class _UseRepoDisposed implements Exception {
   const _UseRepoDisposed();
 }
 
+final class _UseRepoDebugTracker {
+  UseRepoDebugTriggerInfo? latestTrigger;
+  var activeRebuildCount = 0;
+  var totalRebuildCount = 0;
+  var supersededRebuildCount = 0;
+  var disposed = false;
+}
+
 final class _WatchedPayloadStreamDependency<T> {
-  _WatchedPayloadStreamDependency({required this.sourceKey});
+  _WatchedPayloadStreamDependency({
+    required this.sourceKey,
+    required this.payloadType,
+    required this.streamType,
+  });
 
   final Object sourceKey;
+  final Type payloadType;
+  final Type streamType;
   late StreamSubscription<T> subscription;
   Object? _latestValue = _missingPayload;
   Object? lastError;
@@ -223,8 +239,125 @@ mixin UseRepoMixin<D, E, L> on LifecycleMixin, LifecycleHooksMixin {
   E? _lastError;
   L? _lastLoading;
 
+  _UseRepoDebugTracker? _useRepoDebugTracker;
+
+  /// Returns a metadata-only snapshot of the current dependency graph.
+  ///
+  /// The snapshot is available only when assertions are enabled. It is
+  /// intended for diagnostics integrations and must not be used to control
+  /// application behavior. Dependency keys, payloads, errors, and stack traces
+  /// are never included.
+  @protected
+  UseRepoDebugSnapshot? get useRepoDebugSnapshot {
+    UseRepoDebugSnapshot? snapshot;
+    assert(() {
+      final tracker = _useRepoDebugTracker;
+      if (tracker == null) return true;
+
+      final dependencies = <UseRepoDependencyDebugInfo>[
+        for (final repo in _watchedRepos.values)
+          UseRepoRepoDependencyDebugInfo(
+            repoType: repo.runtimeType,
+            state: repo.state.hasError
+                ? UseRepoDependencyDebugState.error
+                : repo.state.isLoading
+                ? UseRepoDependencyDebugState.loading
+                : UseRepoDependencyDebugState.data,
+            errorType: repo.state.hasError
+                ? repo.state.asError.error.runtimeType
+                : null,
+          ),
+        for (final entry in _watchedExternalDependencies.entries)
+          UseRepoExternalDependencyDebugInfo(
+            keyType: entry.key.runtimeType,
+            valueType: entry.value.valueType,
+            streamType: entry.value.changeSignal.runtimeType,
+            state: entry.value.hasError
+                ? UseRepoDependencyDebugState.error
+                : UseRepoDependencyDebugState.data,
+            errorType: entry.value.lastError?.runtimeType,
+          ),
+        for (final entry in _watchedPayloadStreamDependencies.entries)
+          UseRepoPayloadDependencyDebugInfo(
+            keyType: entry.key.runtimeType,
+            sourceKeyType: entry.value.sourceKey.runtimeType,
+            payloadType: entry.value.payloadType,
+            streamType: entry.value.streamType,
+            state: entry.value.hasError
+                ? UseRepoDependencyDebugState.error
+                : entry.value.isClosed
+                ? UseRepoDependencyDebugState.closed
+                : entry.value.hasValue
+                ? UseRepoDependencyDebugState.data
+                : UseRepoDependencyDebugState.pending,
+            errorType: entry.value.lastError?.runtimeType,
+          ),
+      ];
+
+      snapshot = UseRepoDebugSnapshot(
+        state: tracker.disposed
+            ? UseRepoDebugState.disposed
+            : _lastError != null
+            ? UseRepoDebugState.error
+            : _lastData != null
+            ? UseRepoDebugState.data
+            : UseRepoDebugState.loading,
+        latestTrigger: tracker.latestTrigger,
+        dependencies: dependencies,
+        pendingRepoTypes: _pendingRepoResolutions.keys.toList(),
+        subscriptionCount: _subs.length,
+        stateChangeVersion: _stateChangeVersion,
+        activeRebuildCount: tracker.activeRebuildCount,
+        totalRebuildCount: tracker.totalRebuildCount,
+        supersededRebuildCount: tracker.supersededRebuildCount,
+      );
+      return true;
+    }());
+    return snapshot;
+  }
+
+  bool _recordUseRepoDebugTrigger(
+    UseRepoDebugTriggerKind kind, [
+    Type? sourceType,
+  ]) {
+    _useRepoDebugTracker?.latestTrigger = UseRepoDebugTriggerInfo(
+      kind,
+      sourceType: sourceType,
+    );
+    return true;
+  }
+
+  bool _startUseRepoDebugRebuild() {
+    final tracker = _useRepoDebugTracker;
+    if (tracker != null) {
+      tracker.activeRebuildCount++;
+      tracker.totalRebuildCount++;
+    }
+    return true;
+  }
+
+  bool _finishUseRepoDebugRebuild() {
+    final tracker = _useRepoDebugTracker;
+    if (tracker != null && tracker.activeRebuildCount > 0) {
+      tracker.activeRebuildCount--;
+    }
+    return true;
+  }
+
+  bool _recordSupersededUseRepoDebugRebuild() {
+    _useRepoDebugTracker?.supersededRebuildCount++;
+    return true;
+  }
+
   Future<void> _onWatchedRepoStateChange(Repo changedRepo) async {
     if (_useRepoDisposed) return;
+
+    assert(
+      _recordUseRepoDebugTrigger(
+        UseRepoDebugTriggerKind.repoChange,
+        changedRepo.runtimeType,
+      ),
+    );
 
     log(
       'Detected state change in dependencies (${changedRepo.runtimeType}). Re-evaluating...',
@@ -236,95 +369,107 @@ mixin UseRepoMixin<D, E, L> on LifecycleMixin, LifecycleHooksMixin {
   Future<void> _rebuildDependencyState(int version) async {
     if (_useRepoDisposed) return;
 
-    var anyLoading = false;
-    Object? firstError;
-    StackTrace? firstErrorStackTrace;
-
-    D? nextData = _lastData;
-    E? nextError = _lastError;
-    L? nextLoading = _lastLoading;
-
-    for (final repo in _watchedRepos.values) {
-      if (repo.state.hasError) {
-        log(
-          'Dependency of type ${repo.runtimeType} has error. Rebuilding error state...',
-        );
-        final repoError = repo.state.asError;
-        firstError = repoError.error;
-        firstErrorStackTrace = repoError.stackTrace;
-        break;
-      }
-      if (repo.state.isLoading) {
-        log(
-          'Dependency of type ${repo.runtimeType} is loading. Rebuilding loading state...',
-        );
-        anyLoading = true;
-      }
-    }
-
-    if (firstError == null) {
-      for (final entry in _watchedExternalDependencies.entries) {
-        final dependency = entry.value;
-        if (!dependency.hasError) continue;
-
-        log(
-          'External dependency with key ${entry.key.runtimeType} has error. Rebuilding error state...',
-        );
-        firstError = dependency.lastError;
-        firstErrorStackTrace = dependency.lastStackTrace;
-        break;
-      }
-    }
-
-    final allDataReady = !anyLoading && firstError == null;
+    assert(_startUseRepoDebugRebuild());
 
     try {
-      if (firstError != null) {
-        nextError = await onDependencyError(firstError, firstErrorStackTrace);
-        nextLoading = null;
-        nextData = null;
-      } else if (anyLoading) {
-        nextError = null;
-        nextLoading = onDependenciesLoading();
-        nextData = null;
-      } else if (allDataReady) {
-        log('All dependencies are ready. Rebuilding data...');
-        nextError = null;
-        nextLoading = null;
-        nextData = await _onDependenciesReady();
-        log('Dependencies ready, obtained new data.');
+      var anyLoading = false;
+      Object? firstError;
+      StackTrace? firstErrorStackTrace;
+
+      D? nextData = _lastData;
+      E? nextError = _lastError;
+      L? nextLoading = _lastLoading;
+
+      for (final repo in _watchedRepos.values) {
+        if (repo.state.hasError) {
+          log(
+            'Dependency of type ${repo.runtimeType} has error. Rebuilding error state...',
+          );
+          final repoError = repo.state.asError;
+          firstError = repoError.error;
+          firstErrorStackTrace = repoError.stackTrace;
+          break;
+        }
+        if (repo.state.isLoading) {
+          log(
+            'Dependency of type ${repo.runtimeType} is loading. Rebuilding loading state...',
+          );
+          anyLoading = true;
+        }
       }
-    } on _UseRepoDisposed {
-      return;
-    } on NoRepoDataError catch (e, st) {
-      if (e.state.isLoading) {
-        nextError = null;
-        nextLoading = onDependenciesLoading();
-        nextData = null;
-      } else {
+
+      if (firstError == null) {
+        for (final entry in _watchedExternalDependencies.entries) {
+          final dependency = entry.value;
+          if (!dependency.hasError) continue;
+
+          log(
+            'External dependency with key ${entry.key.runtimeType} has error. Rebuilding error state...',
+          );
+          firstError = dependency.lastError;
+          firstErrorStackTrace = dependency.lastStackTrace;
+          break;
+        }
+      }
+
+      final allDataReady = !anyLoading && firstError == null;
+
+      try {
+        if (firstError != null) {
+          nextError = await onDependencyError(firstError, firstErrorStackTrace);
+          nextLoading = null;
+          nextData = null;
+        } else if (anyLoading) {
+          nextError = null;
+          nextLoading = onDependenciesLoading();
+          nextData = null;
+        } else if (allDataReady) {
+          log('All dependencies are ready. Rebuilding data...');
+          nextError = null;
+          nextLoading = null;
+          nextData = await _onDependenciesReady();
+          log('Dependencies ready, obtained new data.');
+        }
+      } on _UseRepoDisposed {
+        return;
+      } on NoRepoDataError catch (e, st) {
+        if (e.state.isLoading) {
+          nextError = null;
+          nextLoading = onDependenciesLoading();
+          nextData = null;
+        } else {
+          nextError = await onDependencyError(e, st);
+          nextLoading = null;
+          nextData = null;
+        }
+      } catch (e, st) {
         nextError = await onDependencyError(e, st);
         nextLoading = null;
         nextData = null;
       }
-    } catch (e, st) {
-      nextError = await onDependencyError(e, st);
-      nextLoading = null;
-      nextData = null;
+
+      if (_useRepoDisposed) return;
+      if (version != _stateChangeVersion) {
+        assert(_recordSupersededUseRepoDebugRebuild());
+        return;
+      }
+
+      _lastData = nextData;
+      _lastError = nextError;
+      _lastLoading = nextLoading;
+
+      log('State rebuilt, notifying listeners...');
+      await dependenciesChanged();
+    } finally {
+      assert(_finishUseRepoDebugRebuild());
     }
-
-    if (_useRepoDisposed || version != _stateChangeVersion) return;
-
-    _lastData = nextData;
-    _lastError = nextError;
-    _lastLoading = nextLoading;
-
-    log('State rebuilt, notifying listeners...');
-    await dependenciesChanged();
   }
 
   Future<void> _discover() async {
     log('Discovering dependencies...');
-    await refreshDependencies();
+    await _refreshDependenciesWithTrigger(
+      UseRepoDebugTriggerKind.initialization,
+    );
     log(
       'Dependency discovery complete. Currently watching ${_watchedRepos.length} repos.',
     );
@@ -341,13 +486,19 @@ mixin UseRepoMixin<D, E, L> on LifecycleMixin, LifecycleHooksMixin {
   /// subscriptions are reused and any newly accessed dependencies are
   /// discovered in the normal way.
   @protected
-  Future<void> refreshDependencies() async {
+  Future<void> refreshDependencies() =>
+      _refreshDependenciesWithTrigger(UseRepoDebugTriggerKind.explicitRefresh);
+
+  Future<void> _refreshDependenciesWithTrigger(
+    UseRepoDebugTriggerKind trigger,
+  ) async {
     if (!_installed) {
       throw StateError(
         'UseRepoMixin not installed. Call installUseRepoHooks in the constructor.',
       );
     }
 
+    assert(_recordUseRepoDebugTrigger(trigger));
     final version = ++_stateChangeVersion;
     await _rebuildDependencyState(version);
   }
@@ -358,6 +509,11 @@ mixin UseRepoMixin<D, E, L> on LifecycleMixin, LifecycleHooksMixin {
   void installUseRepoHooks() {
     if (_installed) return;
     _installed = true;
+
+    assert(() {
+      _useRepoDebugTracker = _UseRepoDebugTracker();
+      return true;
+    }());
 
     /// Set to loading state initially.
     _lastLoading = onDependenciesLoading();
@@ -376,7 +532,13 @@ mixin UseRepoMixin<D, E, L> on LifecycleMixin, LifecycleHooksMixin {
       }
     });
 
-    onDisposed(() => _useRepoDisposed = true);
+    onDisposed(() {
+      _useRepoDisposed = true;
+      assert(() {
+        _useRepoDebugTracker?.disposed = true;
+        return true;
+      }());
+    });
     onDisposed(() async {
       for (final sub in _subs) {
         await sub.cancel();
@@ -452,6 +614,12 @@ mixin UseRepoMixin<D, E, L> on LifecycleMixin, LifecycleHooksMixin {
 
       log('Discovered new dependency. Now watching ${repo.logTag}');
       _watchedRepos[R] = repo;
+      assert(
+        _recordUseRepoDebugTrigger(
+          UseRepoDebugTriggerKind.repoResolved,
+          repo.runtimeType,
+        ),
+      );
 
       final stateAtSubscription = repo.state;
       var awaitingInitialReplay = true;
@@ -493,12 +661,12 @@ mixin UseRepoMixin<D, E, L> on LifecycleMixin, LifecycleHooksMixin {
 
     final watchedDependency = _watchedExternalDependencies[key];
     if (watchedDependency == null) {
-      _watchedExternalDependencies[key] = _subscribeToExternalDependency(
+      _watchedExternalDependencies[key] = _subscribeToExternalDependency<T>(
         key,
         changeSignal,
       );
     } else if (!identical(watchedDependency.changeSignal, changeSignal)) {
-      _replaceExternalDependency(
+      _replaceExternalDependency<T>(
         key,
         watchedDependency: watchedDependency,
         changeSignal: changeSignal,
@@ -551,7 +719,7 @@ mixin UseRepoMixin<D, E, L> on LifecycleMixin, LifecycleHooksMixin {
     return dependency.value as T;
   }
 
-  _WatchedExternalDependency _subscribeToExternalDependency(
+  _WatchedExternalDependency _subscribeToExternalDependency<T>(
     Object key,
     Stream changeSignal,
   ) {
@@ -562,6 +730,12 @@ mixin UseRepoMixin<D, E, L> on LifecycleMixin, LifecycleHooksMixin {
           return;
         }
         watchedDependency.clearError();
+        assert(
+          _recordUseRepoDebugTrigger(
+            UseRepoDebugTriggerKind.externalSignal,
+            key.runtimeType,
+          ),
+        );
         final version = ++_stateChangeVersion;
         await _rebuildDependencyState(version);
       },
@@ -570,6 +744,12 @@ mixin UseRepoMixin<D, E, L> on LifecycleMixin, LifecycleHooksMixin {
           return;
         }
         watchedDependency.setError(error, stackTrace);
+        assert(
+          _recordUseRepoDebugTrigger(
+            UseRepoDebugTriggerKind.externalError,
+            key.runtimeType,
+          ),
+        );
         final version = ++_stateChangeVersion;
         await _rebuildDependencyState(version);
       },
@@ -578,20 +758,21 @@ mixin UseRepoMixin<D, E, L> on LifecycleMixin, LifecycleHooksMixin {
     watchedDependency = _WatchedExternalDependency(
       changeSignal: changeSignal,
       subscription: sub,
+      valueType: T,
     );
     _subs.add(sub);
 
     return watchedDependency;
   }
 
-  void _replaceExternalDependency(
+  void _replaceExternalDependency<T>(
     Object key, {
     required _WatchedExternalDependency watchedDependency,
     required Stream changeSignal,
   }) {
     _subs.remove(watchedDependency.subscription);
     unawaited(watchedDependency.subscription.cancel());
-    _watchedExternalDependencies[key] = _subscribeToExternalDependency(
+    _watchedExternalDependencies[key] = _subscribeToExternalDependency<T>(
       key,
       changeSignal,
     );
@@ -604,6 +785,8 @@ mixin UseRepoMixin<D, E, L> on LifecycleMixin, LifecycleHooksMixin {
   }) {
     final watchedDependency = _WatchedPayloadStreamDependency<T>(
       sourceKey: sourceKey,
+      payloadType: T,
+      streamType: stream.runtimeType,
     );
 
     _watchedPayloadStreamDependencies[key] = watchedDependency;
@@ -617,6 +800,12 @@ mixin UseRepoMixin<D, E, L> on LifecycleMixin, LifecycleHooksMixin {
           return;
         }
         watchedDependency.setValue(value);
+        assert(
+          _recordUseRepoDebugTrigger(
+            UseRepoDebugTriggerKind.payloadValue,
+            key.runtimeType,
+          ),
+        );
         final version = ++_stateChangeVersion;
         await _rebuildDependencyState(version);
       },
@@ -628,6 +817,12 @@ mixin UseRepoMixin<D, E, L> on LifecycleMixin, LifecycleHooksMixin {
           return;
         }
         watchedDependency.setError(error, stackTrace);
+        assert(
+          _recordUseRepoDebugTrigger(
+            UseRepoDebugTriggerKind.payloadError,
+            key.runtimeType,
+          ),
+        );
         final version = ++_stateChangeVersion;
         await _rebuildDependencyState(version);
       },
@@ -640,6 +835,12 @@ mixin UseRepoMixin<D, E, L> on LifecycleMixin, LifecycleHooksMixin {
           return;
         }
         watchedDependency.isClosed = true;
+        assert(
+          _recordUseRepoDebugTrigger(
+            UseRepoDebugTriggerKind.payloadClosed,
+            key.runtimeType,
+          ),
+        );
 
         scheduleMicrotask(() {
           if (_useRepoDisposed ||
