@@ -264,3 +264,20 @@ Export them from the **domain** (`models.dart`, `datasources.dart`, `services.da
 ## License
 
 MIT License. See [LICENSE](LICENSE) file for details.
+
+## Sister packages
+
+Explore the other packages in the Grumpy ecosystem:
+
+| Package | Purpose |
+| --- | --- |
+| [grumpy_annotations](https://github.com/mcquenji/grumpy_annotations) | Annotations for architecture rules and code generation. |
+| [grumpy_flutter](https://github.com/mcquenji/grumpy_flutter) | Flutter components, screens, routing, and responsive views. |
+| [grumpy_cli](https://github.com/mcquenji/grumpy_cli) | Typed command-line applications, configuration, and prompts. |
+| [grumpy_io](https://github.com/mcquenji/grumpy_io) | File system, networking, and other IO utilities. |
+| [grumpy_gen](https://github.com/mcquenji/grumpy_gen) | Route and typed configuration code generation. |
+| [grumpy_lints](https://github.com/mcquenji/grumpy_lints) | Analyzer rules for Grumpy architecture conventions. |
+| [grumpy_context](https://github.com/mcquenji/grumpy_context) | Project discovery and shared generation configuration. |
+| [grumpy_bricks](https://github.com/mcquenji/grumpy_bricks) | Mason bricks for generating Grumpy architecture units. |
+| [grumpy_posthog](https://github.com/mcquenji/grumpy_posthog) | PostHog integration package scaffold (not yet implemented). |
+| [grumpy_sentry](https://github.com/mcquenji/grumpy_sentry) | Sentry integration package scaffold (not yet implemented). |
