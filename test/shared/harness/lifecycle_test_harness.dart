@@ -45,7 +45,7 @@ class HookedLifecycle
   bool disposed = false;
 
   @override
-  void log(String message, [Object? error, StackTrace? stackTrace]) {
+  void log(Object message, [Object? error, StackTrace? stackTrace]) {
     // No-op logger for tests.
   }
 
