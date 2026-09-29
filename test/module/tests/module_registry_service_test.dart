@@ -308,7 +308,7 @@ void main() {
       expect(registry.isActive(module), isTrue);
     });
 
-    test('forceDispose disposes module instead of warm deactivating', () async {
+    test('forceDispose deactivates then disposes the module', () async {
       final registry = CanonicalModuleRegistryService<int, Cfg>();
       final module = ScopedMountedModule();
 
@@ -318,7 +318,7 @@ void main() {
       await registry.forceDispose(module);
 
       expect(module.freeCalls, 1);
-      expect(module.deactivateCalls, 0);
+      expect(module.deactivateCalls, 1);
       expect(registry.isActive(module), isFalse);
       expect(registry.getByType(ScopedMountedModule), isNull);
     });

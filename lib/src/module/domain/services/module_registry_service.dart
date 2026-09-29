@@ -99,6 +99,11 @@ abstract class ModuleRegistryService<T, Config extends Object> extends Service {
   /// graph are deactivated.
   Future<void> sync(Iterable<Module<T, Config>> requiredModules);
 
+  /// Stops activation and releases mounted modules in reverse dependency order.
+  ///
+  /// Root scopes are released by their owning application's shutdown method.
+  Future<void> shutdown();
+
   @override
   bool get singelton => true;
 }

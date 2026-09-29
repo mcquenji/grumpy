@@ -13,6 +13,7 @@ export '../presentation/presentation.dart';
 import 'dart:async';
 
 import 'package:get_it/get_it.dart' hide Disposable;
+import 'package:get_it/get_it.dart' as di;
 import 'package:grumpy/src/transactions/infra/services/services.dart';
 import 'package:logging/logging.dart';
 import 'package:meta/meta.dart';
@@ -79,8 +80,41 @@ abstract class Module<RouteType, Config extends Object>
   Level get logLevel => Level.FINEST;
 
   bool _disposed = false;
+  bool _ownsScope = false;
+  Future<void>? _initializeFuture, _destroyFuture;
+  final List<Future<void> Function()> _releases = [];
+  final Set<Object> _released = Set.identity();
+  final List<(Object, StackTrace)> _disposalErrors = [];
+  bool _superDestroyed = false;
+
+  Future<void> _disposeValue(Object value) async {
+    if (_released.add(value) && value is di.Disposable) await value.onDispose();
+  }
+
+  /// Registers an instance in this module's scope.
+  ///
+  /// Set [owned] to false for aliases or values owned by the host.
+  @protected
+  void bindInstance<T extends Object>(T value, {bool owned = true}) {
+    if (!owned) {
+      _di.registerFactory<T>(() => value);
+      return;
+    }
+    _di.registerSingleton<T>(value);
+    _releases.add(() async {
+      await _di.unregister<T>(
+        instance: value,
+        disposingFunction: _disposeValue,
+      );
+    });
+  }
+
+  /// Registers application infrastructure before ordinary feature bindings.
+  @protected
+  void bindInfrastructure() {}
+
   final List<Future<Repo<dynamic>> Function()> _repoResolvers = [];
-  final List<Future<LifecycleMixin> Function()> _injectableResolvers = [];
+  final List<Future<LifecycleMixin?> Function()> _injectableResolvers = [];
   final List<Repo<dynamic>> _activeRepos = [];
   final Set<Repo<dynamic>> _activeRepoSet = {};
   final List<LifecycleMixin> _activeInjectables = [];
@@ -136,6 +170,7 @@ abstract class Module<RouteType, Config extends Object>
     final lifecycleManaged = probe is LifecycleMixin;
 
     if (lifecycleManaged && !probe.singelton) {
+      _releases.add(() => _disposeValue(probe));
       throw StateError(
         'Lifecycle-capable injectable ${probe.runtimeType} must be singleton. '
         'Set singelton => true or remove LifecycleMixin.',
@@ -143,23 +178,34 @@ abstract class Module<RouteType, Config extends Object>
     }
 
     if (probe.singelton) {
-      _di.registerLazySingleton<T>(() {
-        if (lifecycleManaged &&
-            !_isActive &&
-            !_isActivating &&
-            !_isInitializing) {
-          throw StateError(
-            'Lifecycle-managed injectable ${probe.runtimeType} cannot be resolved '
-            'before $logTag.activate() completes.',
-          );
-        }
-        return builder(_di.get<Config>(), _di.get);
-      });
-
       if (lifecycleManaged) {
+        var resolved = false;
+        _di.registerLazySingleton<T>(() {
+          if (!_isActive && !_isActivating && !_isInitializing) {
+            throw StateError(
+              'Lifecycle-managed $T cannot be resolved before activation.',
+            );
+          }
+          resolved = true;
+          return probe;
+        });
+        _releases.add(() async {
+          if (resolved) {
+            await _di.unregister<T>(
+              instance: probe,
+              disposingFunction: _disposeValue,
+            );
+          } else {
+            await _disposeValue(probe);
+          }
+        });
         _injectableResolvers.add(() async => _di.get<T>() as LifecycleMixin);
+      } else {
+        bindInstance<T>(probe);
       }
     } else {
+      // A lifetime probe is not a DI-managed factory instance.
+      _releases.add(() => _disposeValue(probe));
       _di.registerFactory<T>(() => builder(_di.get<Config>(), _di.get));
     }
   }
@@ -173,20 +219,21 @@ abstract class Module<RouteType, Config extends Object>
     try {
       for (final resolveInjectable in _injectableResolvers) {
         final injectable = await resolveInjectable();
+        if (injectable == null) continue;
         if (_initializedInjectables.add(injectable)) {
           await injectable.initialize();
         }
         if (_activeInjectableSet.add(injectable)) {
-          await injectable.activate();
           _activeInjectables.add(injectable);
+          await injectable.activate();
         }
       }
 
       for (final resolveRepo in _repoResolvers) {
         final repo = await resolveRepo();
         if (_activeRepoSet.add(repo)) {
-          await repo.activate();
           _activeRepos.add(repo);
+          await repo.activate();
         }
       }
       _isActive = true;
@@ -235,21 +282,26 @@ abstract class Module<RouteType, Config extends Object>
   @mustCallSuper
   @override
   FutureOr<void> deactivate() async {
-    if (!_isActive) return;
-
-    for (final repo in _activeRepos.reversed) {
-      await repo.deactivate();
-    }
+    Object? failure;
+    StackTrace? stack;
+    final values = <LifecycleMixin>[
+      ..._activeRepos.reversed,
+      ..._activeInjectables.reversed,
+    ];
     _activeRepos.clear();
     _activeRepoSet.clear();
-
-    for (final injectable in _activeInjectables.reversed) {
-      await injectable.deactivate();
-    }
     _activeInjectables.clear();
     _activeInjectableSet.clear();
-
     _isActive = false;
+    for (final value in values) {
+      try {
+        await value.deactivate();
+      } catch (e, s) {
+        failure ??= e;
+        stack ??= s;
+      }
+    }
+    if (failure != null) Error.throwWithStackTrace(failure, stack!);
   }
 
   @override
@@ -267,73 +319,110 @@ abstract class Module<RouteType, Config extends Object>
 
   @mustCallSuper
   @override
-  FutureOr<void> initialize() async {
-    if (_isInitializing) return;
+  FutureOr<void> initialize() => _initializeFuture ??= _initialize();
 
-    log('Initializing...');
-
+  Future<void> _initialize() async {
+    if (_disposed) throw StateError('Module has been disposed.');
+    final scope = runtimeType.toString();
+    if (_di.hasScope(scope)) throw StateError('Scope $scope is already owned.');
     _isInitializing = true;
-
     try {
-      _di.pushNewScope(scopeName: runtimeType.toString(), dispose: destroy);
-
-      log('Binding external dependencies');
+      _di.pushNewScope(scopeName: scope, dispose: _disposeScope);
+      _ownsScope = true;
+      bindInfrastructure();
       bindExternalDeps(<T extends Object>(builder) {
-        _di.registerSingleton<T>(builder(_di.get<Config>(), _di.get));
+        bindInstance<T>(builder(_di.get<Config>(), _di.get));
       });
-
-      log('Binding services');
-      bindServices(<T extends Service>(InjectableFactory<T, Config> builder) {
-        _bindInjectable<T>(builder);
-      });
-
-      log('Binding datasources');
-      bindDatasources(<T extends Datasource>(
-        InjectableFactory<T, Config> builder,
-      ) {
-        _bindInjectable<T>(builder);
-      });
-
-      log('Binding repositories');
-      bindRepos(<T extends Repo>(InjectableFactory<Repo, Config> builder) {
-        _repoResolvers.add(() async => await _di.getAsync<T>());
-
-        _di.registerLazySingletonAsync<T>(
-          () async {
-            final repo = builder(_di.get<Config>(), _di.get);
-
+      bindServices(<T extends Service>(builder) => _bindInjectable<T>(builder));
+      bindDatasources(
+        <T extends Datasource>(builder) => _bindInjectable<T>(builder),
+      );
+      bindRepos(<T extends Repo>(builder) {
+        _di.registerLazySingletonAsync<T>(() async {
+          final repo = builder(_di.get<Config>(), _di.get);
+          try {
             await repo.initialize();
-            return repo as T;
-          },
-          dispose: (repo) async {
-            await repo.destroy();
-          },
-        );
+          } catch (_) {
+            await _disposeValue(repo);
+            rethrow;
+          }
+          _releases.add(() async {
+            await _di.unregister<T>(
+              instance: repo,
+              disposingFunction: _disposeValue,
+            );
+          });
+          return repo;
+        }, dispose: (_) {});
+        _repoResolvers.add(() => _di.getAsync<T>());
       });
-    } catch (e, s) {
-      log('Error during initialization', e, s);
-      if (_di.hasScope(runtimeType.toString())) {
-        _disposed = true;
-        await _di.popScopesTill(runtimeType.toString());
-      }
+    } catch (_) {
+      // Do not dispatch to root shutdown while initialization is incomplete.
+      try {
+        await _destroyModule();
+      } catch (_) {}
       rethrow;
     } finally {
       _isInitializing = false;
-      log('Initialization complete.');
     }
+  }
+
+  Future<void> _disposeScope() async {
+    Object? failure;
+    StackTrace? stack;
+    _disposed = true;
+    final releases = _releases.reversed.toList();
+    _releases.clear();
+    for (final release in releases) {
+      try {
+        await release();
+      } catch (e, s) {
+        failure ??= e;
+        stack ??= s;
+      }
+    }
+    if (failure != null) _disposalErrors.add((failure, stack!));
   }
 
   @override
   @mustCallSuper
   FutureOr<void> destroy() async {
-    if (_disposed) return;
-    _disposed = true;
-
-    await super.destroy();
-
-    if (_di.hasScope(runtimeType.toString())) {
-      await _di.popScopesTill(runtimeType.toString());
+    await _destroyModule();
+    if (!_superDestroyed) {
+      _superDestroyed = true;
+      await super.destroy();
     }
+  }
+
+  Future<void> _destroyModule() => _destroyFuture ??= _destroyOwnedScope();
+
+  Future<void> _destroyOwnedScope() async {
+    Object? failure;
+    StackTrace? stack;
+    try {
+      if (_isActive ||
+          _activeRepos.isNotEmpty ||
+          _activeInjectables.isNotEmpty) {
+        await deactivate();
+      }
+    } catch (e, s) {
+      failure = e;
+      stack = s;
+    }
+    try {
+      if (_ownsScope && _di.hasScope(runtimeType.toString())) {
+        await _di.dropScope(runtimeType.toString());
+      }
+    } catch (e, s) {
+      failure ??= e;
+      stack ??= s;
+    }
+    _disposed = true;
+    if (_disposalErrors.isNotEmpty) {
+      failure ??= _disposalErrors.first.$1;
+      stack ??= _disposalErrors.first.$2;
+    }
+    if (failure != null) Error.throwWithStackTrace(failure, stack!);
   }
 
   /// The routes provided by this module.
@@ -526,51 +615,80 @@ abstract class RootModule<RouteType, Config extends Object>
   get txEngineFactoryServiceBuilder =>
       (cfg, _) => DefaultTxEngineFactoryService();
 
+  ModuleRegistryService<RouteType, Config>? _registry;
+
   @override
-  FutureOr<void> initialize() {
-    _di.registerSingleton<Config>(cfg);
-
-    _isInitializing = true;
-    try {
-      _bindInjectable<TelemetryService>(telemetryServiceBuilder);
-      _bindInjectable<AnalyticsService>(analyticsServiceBuilder);
-      _bindInjectable<ModuleRegistryService<RouteType, Config>>(
-        moduleRegistryServiceBuilder,
-      );
-      _bindInjectable<RoutingService<RouteType, Config>>(routingServiceBuilder);
-      _di.registerLazySingleton<DependencyReadiness>(
-        () => _di.get<RoutingService<RouteType, Config>>(),
-      );
-      _bindInjectable<MemoryCacheLayerService>(memoryCacheLayerServiceBuilder);
-      if (fileCacheLayerServiceBuilder != null) {
-        _bindInjectable<FileCacheLayerService>(fileCacheLayerServiceBuilder!);
-      }
-      _bindInjectable<CachePipelineService>(cachePipelineServiceBuilder);
-      _bindInjectable<RepoStatePersistenceService>(
-        repoStatePersistenceServiceBuilder,
-      );
-      _bindInjectable<RepoBootstrapService>(repoBootstrapServiceBuilder);
-      _bindInjectable<TxEngineFactoryService>(txEngineFactoryServiceBuilder);
-    } catch (e, s) {
-      log('Failed to initialize $logTag', e, s);
-    } finally {
-      _isInitializing = false;
+  void bindInfrastructure() {
+    bindInstance<Config>(cfg, owned: false);
+    _bindInjectable<TelemetryService>(telemetryServiceBuilder);
+    _bindInjectable<AnalyticsService>(analyticsServiceBuilder);
+    _bindInjectable<ModuleRegistryService<RouteType, Config>>(
+      (cfg, resolve) => _registry = moduleRegistryServiceBuilder(cfg, resolve),
+    );
+    _di.get<ModuleRegistryService<RouteType, Config>>();
+    _bindInjectable<MemoryCacheLayerService>(memoryCacheLayerServiceBuilder);
+    if (fileCacheLayerServiceBuilder != null) {
+      _bindInjectable<FileCacheLayerService>(fileCacheLayerServiceBuilder!);
     }
-
-    return super.initialize();
+    _bindInjectable<CachePipelineService>(cachePipelineServiceBuilder);
+    _bindInjectable<RepoStatePersistenceService>(
+      repoStatePersistenceServiceBuilder,
+    );
+    _bindInjectable<RepoBootstrapService>(repoBootstrapServiceBuilder);
+    _bindInjectable<TxEngineFactoryService>(txEngineFactoryServiceBuilder);
+    // Routing may depend on application bindings; construct it lazily.
+    RoutingService<RouteType, Config>? router;
+    _di.registerLazySingleton<RoutingService<RouteType, Config>>(() {
+      final value = router = routingServiceBuilder(cfg, _di.get);
+      _releases.add(() async {
+        await _di.unregister<RoutingService<RouteType, Config>>(
+          instance: value,
+          disposingFunction: _disposeValue,
+        );
+      });
+      return value;
+    }, dispose: (_) {});
+    _injectableResolvers.add(() async {
+      final value = _di.get<RoutingService<RouteType, Config>>();
+      return value is LifecycleMixin ? value as LifecycleMixin : null;
+    });
+    _di.registerFactory<DependencyReadiness>(
+      () => router ?? _di.get<RoutingService<RouteType, Config>>(),
+    );
   }
 
   /// The root route of this module.
   Route<RouteType, Config> get root => routes.root ?? Route.root(routes);
 
-  @nonVirtual
+  Future<void>? _shutdownFuture;
+
+  /// Awaits dependency-ordered shutdown and releases only this app's resources.
+  ///
+  /// Safe to call repeatedly, including after partial bootstrap failure.
+  Future<void> shutdown() => _shutdownFuture ??= _shutdown();
+
+  Future<void> _shutdown() async {
+    Object? failure;
+    StackTrace? stack;
+    try {
+      await _registry?.shutdown();
+    } catch (e, s) {
+      failure = e;
+      stack = s;
+    }
+    try {
+      await super.destroy();
+    } catch (e, s) {
+      failure ??= e;
+      stack ??= s;
+    }
+    if (failure != null) Error.throwWithStackTrace(failure, stack!);
+  }
+
   @override
-  // if the root module is disposed, something is very wrong.
-  // ignore: must_call_super
-  FutureOr<void> destroy() {
-    throw StateError(
-      'RootModule should not be disposed. It lives throughout the application lifecycle.',
-    );
+  FutureOr<void> destroy() async {
+    await shutdown();
+    await super.destroy();
   }
 
   @override
@@ -593,7 +711,14 @@ abstract class RootModule<RouteType, Config extends Object>
   }
 
   Future<void> _bootstrap() async {
-    await initialize();
-    await ModuleRegistryService<RouteType, Config>().ensureActive(this);
+    try {
+      await initialize();
+      await ModuleRegistryService<RouteType, Config>().ensureActive(this);
+    } catch (_) {
+      try {
+        await shutdown();
+      } catch (_) {}
+      rethrow;
+    }
   }
 }

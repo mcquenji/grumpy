@@ -19,3 +19,10 @@ class SettingsModule extends Module<Object, AppConfig> {
   List<Route<Object, AppConfig>> get routes => const [];
 }
 ```
+
+
+## Application shutdown
+
+Call `await app.shutdown()` when a root application's lifetime ends. Shutdown waits for pending module activation, deactivates dependents before dependencies, and releases owned module scopes and root registrations. Cleanup continues when an individual resource fails, then reports the first failure. Repeated shutdown calls share completion.
+
+Bootstrap propagates initialization failures and cleans up partially started applications. Scope ownership preserves unrelated GetIt registrations and scopes. Flutter applications retain their usual long-lived lifecycle until shutdown is explicitly requested.

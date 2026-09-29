@@ -26,6 +26,8 @@ class CanonicalModuleRegistryService<T, Config extends Object>
   final Set<Module<T, Config>> _syncedModules = {};
 
   Future<void> _pending = Future<void>.value();
+  Future<void>? _shutdownFuture;
+  bool _stopping = false;
   GetIt get _di => GetIt.instance;
 
   @override
@@ -160,6 +162,7 @@ class CanonicalModuleRegistryService<T, Config extends Object>
 
   @override
   Future<void> sync(Iterable<Module<T, Config>> requiredModules) {
+    if (_stopping && requiredModules.isEmpty) return Future.value();
     log('Syncing modules: $requiredModules');
     if (requiredModules.isEmpty &&
         _pinnedModules.isEmpty &&
@@ -177,6 +180,9 @@ class CanonicalModuleRegistryService<T, Config extends Object>
 
   Future<void> _enqueueSync() {
     log('Enqueuing sync...');
+    if (_stopping) {
+      return Future.error(StateError('Module registry is stopping.'));
+    }
     return _pending = () async {
       log('Waiting for previous sync to complete...');
       await _pending;
@@ -209,8 +215,8 @@ class CanonicalModuleRegistryService<T, Config extends Object>
         } else {
           log('Initializing $module');
 
-          await module.initialize();
           _mountedModules.add(module);
+          await module.initialize();
           log('Mounted module: $module');
         }
       }
@@ -268,7 +274,7 @@ class CanonicalModuleRegistryService<T, Config extends Object>
 
   @override
   FutureOr<void> deactivate() async {
-    await sync(<Module<T, Config>>[]);
+    if (!_stopping) await sync(<Module<T, Config>>[]);
   }
 
   @override
@@ -279,10 +285,44 @@ class CanonicalModuleRegistryService<T, Config extends Object>
 
   @override
   FutureOr<void> destroy() async {
+    await shutdown();
+    await super.destroy();
+  }
+
+  @override
+  Future<void> shutdown() => _shutdownFuture ??= _shutdown();
+  Future<void> _shutdown() async {
+    _stopping = true;
+    try {
+      await _pending;
+    } catch (_) {
+      /* Partial startup still owns resources. */
+    }
+    Object? failure;
+    StackTrace? stack;
+    Future<void> attempt(FutureOr<void> Function() action) async {
+      try {
+        await action();
+      } catch (e, s) {
+        failure ??= e;
+        stack ??= s;
+      }
+    }
+
+    final order = _topological(_mountedModules).reversed.toList();
     _pinnedModules.clear();
     _syncedModules.clear();
-    await deactivate();
-    await super.destroy();
+    for (final module in order) {
+      await attempt(module.deactivate);
+    }
+    _activeModules.clear();
+    for (final module in order) {
+      if (module is! RootModule) await attempt(module.destroy);
+    }
+    _mountedModules.clear();
+    _dependencyGraph.clear();
+    _modulesByType.clear();
+    if (failure != null) Error.throwWithStackTrace(failure!, stack!);
   }
 
   @override
