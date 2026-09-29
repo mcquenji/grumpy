@@ -2,7 +2,7 @@ include: package:lints/recommended.yaml
 plugins:
   grumpy_lints:
     git:
-      url: https://github.com/necodeIT/grumpy_lints.git
+      url: https://github.com/mcquenji/grumpy_lints.git
     diagnostics:
       must_call_in_constructor:
         enabled: true
