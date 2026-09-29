@@ -4,13 +4,68 @@ import 'package:routingkit/routingkit.dart';
 import 'package:grumpy/grumpy.dart';
 import 'package:rxdart/rxdart.dart';
 
+final class _RoutingMiddlewareDebugTracker {
+  _RoutingMiddlewareDebugTracker(this.middlewareType);
+
+  final Type middlewareType;
+  var state = RoutingDebugStepState.pending;
+}
+
+final class _RoutingDebugTracker {
+  _RoutingDebugTracker(Uri uri)
+    : requestKey = _routingDebugRequestKey(uri),
+      pathSegmentCount = uri.pathSegments.length,
+      queryParameterNames = uri.queryParametersAll.keys.toList()..sort(),
+      hasFragment = uri.fragment.isNotEmpty,
+      stopwatch = Stopwatch()..start();
+
+  final (int, int) requestKey;
+  final int pathSegmentCount;
+  final List<String> queryParameterNames;
+  final bool hasFragment;
+  final Stopwatch stopwatch;
+  var phase = RoutingDebugPhase.matching;
+  String? routePattern;
+  List<RouteDebugInfo> lineage = const [];
+  List<Type> moduleTypes = const [];
+  List<_RoutingMiddlewareDebugTracker> middleware = const [];
+  List<String> pathParameterNames = const [];
+  Type? failureType;
+  var coalescedNavigationCount = 0;
+
+  RoutingDebugSnapshot snapshot() => RoutingDebugSnapshot(
+    phase: phase,
+    routePattern: routePattern,
+    lineage: lineage,
+    moduleTypes: moduleTypes,
+    middleware: [
+      for (final entry in middleware)
+        RoutingMiddlewareDebugInfo(
+          middlewareType: entry.middlewareType,
+          state: entry.state,
+        ),
+    ],
+    pathSegmentCount: pathSegmentCount,
+    pathParameterNames: pathParameterNames,
+    queryParameterNames: queryParameterNames,
+    hasFragment: hasFragment,
+    elapsed: stopwatch.elapsed,
+    coalescedNavigationCount: coalescedNavigationCount,
+    failureType: failureType,
+  );
+}
+
+(int, int) _routingDebugRequestKey(Uri uri) =>
+    (uri.hashCode, uri.toString().length);
+
 /// [RoutingService] impementation that uses RoutingKit for route parsing and matching.
 ///
 /// {@category routing}
 
 class RoutingKitRoutingService<T, Config extends Object>
     extends RoutingService<T, Config>
-    with LifecycleMixin {
+    with LifecycleMixin
+    implements RoutingDebugInfoProvider {
   /// [RoutingService] impementation that uses RoutingKit for route parsing and matching.
   RoutingKitRoutingService(
     this.rootModule, {
@@ -45,6 +100,132 @@ class RoutingKitRoutingService<T, Config extends Object>
   final _viewChangeController = BehaviorSubject<ViewChangedEvent<T, Config>>();
   ViewChangedEvent<T, Config>? _activeViewChange;
 
+  final Map<(int, int), _RoutingDebugTracker> _activeRoutingDebugTrackers = {};
+  _RoutingDebugTracker? _latestRoutingDebugTracker;
+
+  @override
+  RoutingDebugSnapshot? debugSnapshotFor(Uri uri) {
+    RoutingDebugSnapshot? snapshot;
+    assert(() {
+      final tracker =
+          _activeRoutingDebugTrackers[_routingDebugRequestKey(uri)] ??
+          (_latestRoutingDebugTracker?.requestKey ==
+                  _routingDebugRequestKey(uri)
+              ? _latestRoutingDebugTracker
+              : null);
+      snapshot = tracker?.snapshot();
+      return true;
+    }());
+    return snapshot;
+  }
+
+  bool _startRoutingDebug(Uri uri) {
+    _activeRoutingDebugTrackers[_routingDebugRequestKey(uri)] =
+        _RoutingDebugTracker(uri);
+    return true;
+  }
+
+  bool _coalesceRoutingDebug(Uri uri) {
+    _activeRoutingDebugTrackers[_routingDebugRequestKey(uri)]
+        ?.coalescedNavigationCount++;
+    return true;
+  }
+
+  bool _configureRoutingDebug(
+    Uri uri,
+    List<Route<T, Config>> lineage,
+    RouteContext context,
+    Set<Module<T, Config>> modules,
+  ) {
+    final tracker = _activeRoutingDebugTrackers[_routingDebugRequestKey(uri)];
+    if (tracker == null) return true;
+
+    tracker
+      ..routePattern = _declaredRoutePattern(lineage)
+      ..lineage = [
+        for (final route in lineage)
+          RouteDebugInfo(
+            routeType: route.runtimeType,
+            declaredPath: route.path,
+            moduleType: route is ModuleRoute<T, Config>
+                ? route.module.runtimeType
+                : null,
+            leafType: route is LeafRoute<T, Config>
+                ? route.view.runtimeType
+                : null,
+            middlewareTypes: [
+              for (final item in route.middleware) item.runtimeType,
+            ],
+          ),
+      ]
+      ..moduleTypes = [for (final module in modules) module.runtimeType]
+      ..middleware = [
+        for (final route in lineage)
+          for (final item in route.middleware)
+            _RoutingMiddlewareDebugTracker(item.runtimeType),
+      ]
+      ..pathParameterNames = (context.pathParams.keys.toList()..sort());
+    return true;
+  }
+
+  String _declaredRoutePattern(List<Route<T, Config>> lineage) {
+    final segments = <String>[];
+    for (final route in lineage) {
+      final path = route.path;
+      if (path.isEmpty || path == '/') continue;
+      segments.addAll(path.split('/').where((segment) => segment.isNotEmpty));
+    }
+    return segments.isEmpty ? '/' : '/${segments.join('/')}';
+  }
+
+  bool _setRoutingDebugPhase(Uri uri, RoutingDebugPhase phase) {
+    final tracker = _activeRoutingDebugTrackers[_routingDebugRequestKey(uri)];
+    if (tracker != null) tracker.phase = phase;
+    return true;
+  }
+
+  bool _setMiddlewareDebugState(
+    Uri uri,
+    int index,
+    RoutingDebugStepState state,
+  ) {
+    final tracker = _activeRoutingDebugTrackers[_routingDebugRequestKey(uri)];
+    if (tracker != null && index < tracker.middleware.length) {
+      tracker.middleware[index].state = state;
+    }
+    return true;
+  }
+
+  bool _finishRemainingMiddlewareDebugSteps(Uri uri, int startIndex) {
+    final tracker = _activeRoutingDebugTrackers[_routingDebugRequestKey(uri)];
+    if (tracker == null) return true;
+    for (var i = startIndex; i < tracker.middleware.length; i++) {
+      tracker.middleware[i].state = RoutingDebugStepState.skipped;
+    }
+    return true;
+  }
+
+  bool _failRoutingDebug(Uri uri, RoutingDebugPhase phase, Type failureType) {
+    final tracker = _activeRoutingDebugTrackers[_routingDebugRequestKey(uri)];
+    if (tracker != null) {
+      tracker
+        ..phase = phase
+        ..failureType = failureType;
+    }
+    return true;
+  }
+
+  bool _completeRoutingDebug(Uri uri) {
+    final tracker = _activeRoutingDebugTrackers.remove(
+      _routingDebugRequestKey(uri),
+    );
+    if (tracker != null) {
+      tracker.stopwatch.stop();
+      _latestRoutingDebugTracker = tracker;
+    }
+    return true;
+  }
+
   @override
   RouteContext? get currentContext => _context;
 
@@ -54,6 +235,11 @@ class RoutingKitRoutingService<T, Config extends Object>
     _listeners.clear();
     _routeLineages.clear();
     _pendingNavigations.clear();
+    assert(() {
+      _activeRoutingDebugTrackers.clear();
+      _latestRoutingDebugTracker = null;
+      return true;
+    }());
     if (!_viewChangeController.isClosed) {
       await _viewChangeController.close();
     }
@@ -102,6 +288,11 @@ class RoutingKitRoutingService<T, Config extends Object>
     _context = null;
     _activeViewChange = null;
     _pendingNavigations.clear();
+    assert(() {
+      _activeRoutingDebugTrackers.clear();
+      _latestRoutingDebugTracker = null;
+      return true;
+    }());
     await moduleRegistry.sync(<Module<T, Config>>[]);
   }
 
@@ -112,6 +303,11 @@ class RoutingKitRoutingService<T, Config extends Object>
   FutureOr<void> initialize() {
     _kit = createRouter(caseSensitive: caseSensitive);
     _routeLineages.clear();
+    assert(() {
+      _activeRoutingDebugTrackers.clear();
+      _latestRoutingDebugTracker = null;
+      return true;
+    }());
 
     _addRoute(root, '/');
 
@@ -292,6 +488,7 @@ class RoutingKitRoutingService<T, Config extends Object>
     final uri = Uri.parse(path);
 
     if (_pendingNavigations.containsKey(uri)) {
+      assert(_coalesceRoutingDebug(uri));
       log('Navigation to $path is already in progress, forwarding callback.');
 
       final (future, leaf, context) = _pendingNavigations[uri]!;
@@ -331,6 +528,8 @@ class RoutingKitRoutingService<T, Config extends Object>
       return;
     }
 
+    assert(_startRoutingDebug(uri));
+
     try {
       final cleanPath = uri.path;
 
@@ -358,6 +557,8 @@ class RoutingKitRoutingService<T, Config extends Object>
 
       final (:leaf, :lineage) = _resolveLeafRoute(matchedRoute, path);
       final context = _createContext(uri, match.params);
+      final dependencies = getDependencies(uri.path);
+      assert(_configureRoutingDebug(uri, lineage, context, dependencies));
 
       final future = _navigate(context, leaf, lineage, skipPreview, handler);
 
@@ -365,10 +566,12 @@ class RoutingKitRoutingService<T, Config extends Object>
       _currentNavigation = future;
       await future;
     } catch (e, s) {
+      assert(_failRoutingDebug(uri, RoutingDebugPhase.failed, e.runtimeType));
       log('Navigation to $path failed with error', e, s);
       rethrow;
     } finally {
       _pendingNavigations.remove(uri);
+      assert(_completeRoutingDebug(uri));
     }
   }
 
@@ -380,35 +583,75 @@ class RoutingKitRoutingService<T, Config extends Object>
     void Function(T, bool) callback,
   ) async {
     var context = initialContext;
+    final debugUri = initialContext.uri;
     final previousContext = _context;
     final cleanPath = context.uri.path;
     final middleware = _collectMiddleware(lineage);
 
     log('Navigating to $cleanPath with context: $context');
 
-    if (!skipPreview) callback(leaf.view.preview(context), true);
+    if (!skipPreview) {
+      assert(_setRoutingDebugPhase(debugUri, RoutingDebugPhase.preview));
+      callback(leaf.view.preview(context), true);
+    }
 
     _context = context;
 
     // activate required modules
     final dependencies = getDependencies(cleanPath);
 
+    assert(
+      _setRoutingDebugPhase(debugUri, RoutingDebugPhase.activatingModules),
+    );
     await moduleRegistry.sync(dependencies);
 
     // run middlewares (if any)
     try {
+      assert(
+        _setRoutingDebugPhase(debugUri, RoutingDebugPhase.runningMiddleware),
+      );
       for (var i = 0; i < middleware.length; i++) {
         final currentMiddleware = middleware[i];
+        assert(
+          _setMiddlewareDebugState(debugUri, i, RoutingDebugStepState.running),
+        );
         log(
           'Executing middleware ${i + 1}/${middleware.length}: ${currentMiddleware.logTag}',
         );
         context = await currentMiddleware(context);
         _context = context;
+        assert(
+          _setMiddlewareDebugState(
+            debugUri,
+            i,
+            RoutingDebugStepState.succeeded,
+          ),
+        );
       }
       log(
         'All ${middleware.length} middlewares executed successfully for $cleanPath',
       );
     } catch (e, s) {
+      assert(() {
+        final tracker =
+            _activeRoutingDebugTrackers[_routingDebugRequestKey(debugUri)];
+        final failedIndex = tracker?.middleware.indexWhere(
+          (item) => item.state == RoutingDebugStepState.running,
+        );
+        if (failedIndex != null && failedIndex >= 0) {
+          _setMiddlewareDebugState(
+            debugUri,
+            failedIndex,
+            RoutingDebugStepState.failed,
+          );
+          _finishRemainingMiddlewareDebugSteps(debugUri, failedIndex + 1);
+        }
+        return _failRoutingDebug(
+          debugUri,
+          RoutingDebugPhase.rejected,
+          e.runtimeType,
+        );
+      }());
       _context = previousContext;
       log(
         'A middleware threw an exception during navigation to $cleanPath',
@@ -420,7 +663,10 @@ class RoutingKitRoutingService<T, Config extends Object>
 
     _context = context;
 
-    callback(await leaf.view.content(context), false);
+    assert(_setRoutingDebugPhase(debugUri, RoutingDebugPhase.buildingContent));
+    final content = await leaf.view.content(context);
+    assert(_setRoutingDebugPhase(debugUri, RoutingDebugPhase.completed));
+    callback(content, false);
 
     log('Activated route at $cleanPath');
 
